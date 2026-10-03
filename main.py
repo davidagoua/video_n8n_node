@@ -1,6 +1,5 @@
 import os
 import uuid
-import asyncio
 import subprocess
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
@@ -20,29 +19,24 @@ class TTSRequest(BaseModel):
 
 @app.post("/generate-tts")
 async def generate_tts(payload: TTSRequest):
-    """Génère l'audio MP3 et le fichier de sous-titres SRT."""
+    """Génère uniquement l'audio MP3 (sans sous-titres)."""
     req_id = str(uuid.uuid4())
     audio_path = os.path.join(TMP_DIR, f"{req_id}.mp3")
-    srt_path = os.path.join(TMP_DIR, f"{req_id}.srt")
 
     try:
-        communicate = edge_tts.Communicate(payload.script, payload.voice)
-        submaker = edge_tts.SubMaker()
-
-        with open(audio_path, "wb") as f_audio:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    f_audio.write(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    submaker.feed(chunk)
-
-        with open(srt_path, "w", encoding="utf-8") as f_srt:
-            f_srt.write(submaker.get_srt())
+        cmd = [
+            "edge-tts",
+            "--voice", payload.voice,
+            "--text", payload.script,
+            "--write-media", audio_path
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            raise Exception(f"edge-tts failed: {proc.stderr}")
 
         return {
             "task_id": req_id,
-            "audio_path": audio_path,
-            "subtitles_path": srt_path
+            "audio_path": audio_path
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS generation error: {str(e)}")
@@ -54,32 +48,25 @@ async def render_video(
     video_file: UploadFile = File(...)
 ):
     """
-    Reçoit la vidéo de fond (multipart/form-data), l'associe à l'audio/sous-titres
-    du task_id précédent, et renvoie le MP4 assemblé en binaire.
+    Assemble la vidéo de fond reçue et l'audio MP3 au format 9:16 (sans sous-titres).
     """
     audio_path = os.path.join(TMP_DIR, f"{task_id}.mp3")
-    srt_path = os.path.join(TMP_DIR, f"{task_id}.srt")
     bg_video_path = os.path.join(TMP_DIR, f"{task_id}_bg.mp4")
     output_video_path = os.path.join(TMP_DIR, f"{task_id}_final.mp4")
 
-    if not os.path.exists(audio_path) or not os.path.exists(srt_path):
-        raise HTTPException(status_code=404, detail="Audio or subtitle files not found for this task_id")
+    if not os.path.exists(audio_path):
+        raise HTTPException(status_code=404, detail="Audio file not found for this task_id")
 
-    # Sauvegarde de la vidéo de fond reçue
+    # Écriture du fichier vidéo temporaire
     with open(bg_video_path, "wb") as f_bg:
         f_bg.write(await video_file.read())
 
-    # Format vertical 9:16 (1080x1920) avec sous-titres centrés incrustés
-    video_filters = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        f"subtitles={srt_path}:force_style='FontSize=22,FontName=DejaVu Sans,Bold=1,"
-        "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=2,Alignment=2,MarginV=180'"
-    )
+    # Filtre vidéo : uniquement redimensionnement et recadrage 9:16 (1080x1920)
+    video_filters = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
 
     cmd = [
         "ffmpeg", "-y",
-        "-stream_loop", "-1",
+        "-stream_loop", "-1",        # Boucle la vidéo si elle est plus courte que l'audio
         "-i", bg_video_path,
         "-i", audio_path,
         "-vf", video_filters,
@@ -88,14 +75,14 @@ async def render_video(
         "-c:a", "aac",
         "-b:a", "192k",
         "-pix_fmt", "yuv420p",
-        "-shortest",
+        "-shortest",                 # Arrête la vidéo dès que l'audio se termine
         output_video_path
     ]
 
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc.returncode != 0:
-            raise Exception(proc.stderr)
+            raise Exception(f"FFmpeg error: {proc.stderr}")
 
         return FileResponse(
             path=output_video_path,
@@ -105,7 +92,6 @@ async def render_video(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"FFmpeg error: {str(e)}")
     finally:
-        # Nettoyage des fichiers intermédiaires légers
-        for path in [bg_video_path]:
-            if os.path.exists(path):
-                os.remove(path)
+        # Nettoyage de la vidéo de fond brute
+        if os.path.exists(bg_video_path):
+            os.remove(bg_video_path)
