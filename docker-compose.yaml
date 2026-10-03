@@ -1,0 +1,20 @@
+networks:
+  automation-net:
+    external: true
+
+services:
+  video-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: video-engine
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - video_tmp_data:/tmp/video_engine
+    networks:
+      - automation-net
+
+volumes:
+  video_tmp_data:
