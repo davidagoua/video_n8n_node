@@ -1,6 +1,6 @@
 networks:
   automation-net:
-    external: true
+
 
 services:
   video-engine:
